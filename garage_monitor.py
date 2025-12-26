@@ -14,8 +14,8 @@ TARGET_IP = "10.0.0.2"          # IP неттопа в WireGuard
 PING_INTERVAL = 15             # секунд
 PING_ATTEMPTS = 2              # сколько раз подряд должен пропасть/появиться пинг
 
-from dotenv import load_dotenv
-load_dotenv()  # только при запуске локально
+# from dotenv import load_dotenv
+# load_dotenv()  # только при запуске локально
 
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOTADMIN_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TG_CHAT_ID_BOTADMIN"))
