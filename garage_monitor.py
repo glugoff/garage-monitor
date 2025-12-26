@@ -5,25 +5,29 @@ import os
 import time
 import subprocess
 import logging
-from datetime import datetime
 import requests
-
+import threading
+from datetime import datetime
 
 # === НАСТРОЙКИ ===
 TARGET_IP = "10.0.0.2"          # IP неттопа в WireGuard
 PING_INTERVAL = 15             # секунд
-PING_ATTEMPTS = 2              # сколько раз подряд должен пропасть/появиться пинг
+PING_ATTEMPTS = 2              # подряд для смены состояния
 
-# from dotenv import load_dotenv
-# load_dotenv()  # только при запуске локально
-
-TELEGRAM_BOT_TOKEN = os.getenv("TG_BOTADMIN_TOKEN")
-TELEGRAM_CHAT_ID = int(os.getenv("TG_CHAT_ID_BOTADMIN"))
+# Устройства для команды /ping
+DEVICES = {
+    "192.168.1.2": "📹 Камера",
+    "192.168.1.100": "🌐 Основной роутер",
+    "192.168.1.50": "🌐 Доп. роутер",
+    "192.168.1.25": "🖥️ Неттоп",
+    "192.168.1.15": "💻 Нетбук",
+    "192.168.1.154": "📡 Антенна (балкон)",
+    "192.168.1.254": "📡 Антенна (гараж)",
+}
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 
 def format_duration(seconds):
-    """Преобразует секунды в 'X час Y мин Z сек'."""
     seconds = int(seconds)
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
@@ -40,9 +44,7 @@ def format_duration(seconds):
     return " ".join(parts)
 
 def ping_host(host, timeout=3):
-    """Возвращает True, если хост отвечает на ping."""
     try:
-        # -c 1: один пакет, -W timeout в секундах (Linux)
         result = subprocess.run(
             ["ping", "-c", "1", "-W", str(timeout), host],
             stdout=subprocess.DEVNULL,
@@ -53,11 +55,23 @@ def ping_host(host, timeout=3):
         logging.error(f"Ошибка при пинге {host}: {e}")
         return False
 
-def send_telegram_message(text):
-    """Отправляет сообщение в Telegram."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+def send_telegram_message(text, chat_id=None):
+    """Отправляет сообщение.
+    Если chat_id=None — отправляет в группу (из настроек).
+    Иначе — в указанный чат (например, личку)."""
+    bot_token = os.getenv("TG_BOTADMIN_TOKEN")
+    if not bot_token:
+        logging.error("TG_BOTADMIN_TOKEN не задан!")
+        return
+
+    target_chat = chat_id if chat_id is not None else int(os.getenv("TG_CHAT_ID_BOTADMIN", 0))
+    if target_chat == 0:
+        logging.error("TG_CHAT_ID_BOTADMIN не задан!")
+        return
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target_chat,
         "text": text,
         "parse_mode": "HTML"
     }
@@ -68,7 +82,66 @@ def send_telegram_message(text):
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение: {e}")
 
-# === ОСНОВНАЯ ЛОГИКА ===
+# === ОБРАБОТКА КОМАНД В ЛИЧКЕ ===
+
+def handle_telegram_commands():
+    """Фоновый поток: слушает команды в личных сообщениях."""
+    bot_token = os.getenv("TG_BOTADMIN_TOKEN")
+    if not bot_token:
+        logging.error("Невозможно запустить обработку команд: TG_BOTADMIN_TOKEN не задан")
+        return
+
+    offset = None
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+            params = {"timeout": 30, "offset": offset}
+            response = requests.get(url, params=params, timeout=35)
+            if response.status_code != 200:
+                time.sleep(5)
+                continue
+
+            data = response.json()
+            if not data.get("ok"):
+                time.sleep(5)
+                continue
+
+            for update in data["result"]:
+                offset = update["update_id"] + 1
+
+                message = update.get("message")
+                if not message:
+                    continue
+
+                text = message.get("text")
+                chat = message["chat"]
+                chat_id = chat["id"]
+                chat_type = chat["type"]
+
+                # Только личные сообщения
+                if chat_type != "private":
+                    continue
+
+                if text == "/ping":
+                    lines = ["🔍 Статус гаражных устройств:\n"]
+                    for ip, name in DEVICES.items():
+                        status = "✅" if ping_host(ip) else "❌"
+                        lines.append(f"{status} {name} ({ip})")
+                    reply = "\n".join(lines)
+                    send_telegram_message(reply, chat_id=chat_id)
+
+                elif text == "/start":
+                    send_telegram_message(
+                        "Привет! Я бот для мониторинга гаража.\n"
+                        "Отправь /ping, чтобы проверить доступность всех устройств.",
+                        chat_id=chat_id
+                    )
+
+        except Exception as e:
+            logging.error(f"Ошибка в обработке команд: {e}")
+            time.sleep(5)
+
+# === ОСНОВНОЙ МОНИТОРИНГ СВЯЗИ ===
 
 def main():
     logging.basicConfig(
@@ -77,15 +150,12 @@ def main():
         handlers=[logging.StreamHandler()]
     )
 
-    # Состояния:
-    # - "online": связь есть
-    # - "offline": связь потеряна
-    # - "pending_online": ожидаем подтверждения восстановления (2 пинга)
-    # - "pending_offline": ожидаем подтверждения потери (2 пинга)
-    state = "online"
-    last_change_time = time.time()  # время последнего подтверждённого изменения состояния
+    # Запуск обработчика команд в фоне
+    cmd_thread = threading.Thread(target=handle_telegram_commands, daemon=True)
+    cmd_thread.start()
 
-    # Счётчики подряд идущих результатов
+    state = "online"
+    last_change_time = time.time()
     consecutive_success = 0
     consecutive_fail = 0
 
@@ -101,9 +171,7 @@ def main():
             consecutive_fail += 1
             consecutive_success = 0
 
-        # Обработка переходов
         if state == "online" and consecutive_fail >= PING_ATTEMPTS:
-            # Потеря связи
             downtime_start = time.time()
             uptime_duration = downtime_start - last_change_time
             msg = (
@@ -117,7 +185,6 @@ def main():
             last_change_time = downtime_start
 
         elif state == "offline" and consecutive_success >= PING_ATTEMPTS:
-            # Восстановление связи
             uptime_start = time.time()
             downtime_duration = uptime_start - last_change_time
             msg = (
